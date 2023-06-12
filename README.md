@@ -12,3 +12,9 @@ The device itself symbolises 3 states via 16 neopixels:<br>
 - blue - BLE device not connected 
 - green - BLE connected / ready for operation 
 - red - active heating 
+<br>
+
+## important note 
+
+This project is still **in development**. <br>
+Although everything works in general and I have already soldered several boards, changes in the code may be added or adapted due to improvements or bug fixes. 
