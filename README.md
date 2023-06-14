@@ -2,7 +2,7 @@
 
 <p align="center">
 
-  <img height="290" src="https://github.com/Brightness248/BLEIron/assets/88443560/24eb0b66-d2ea-44a4-a623-6d5b11d18b38">
+  <img height="290" src="https://github.com/Brightness248/BLEIron/blob/main/Images/BLEIRON_LOGO.png?raw=true">
 </p>
 
 **BLEIron** is for makers who want to solder not only through-hole but also SMD components. <br>
