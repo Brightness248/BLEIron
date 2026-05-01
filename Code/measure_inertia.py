@@ -5,11 +5,15 @@ Bestimmt: Totzeit, Anstiegszeit, maximale Temperatur, Overshoot
 
 from machine import Pin, Timer
 import machine
-from time import sleep_ms, time_ns, time
+from time import sleep_ms, time, ticks_ms, ticks_diff
 import ubluetooth
 from max6675 import MAX6675
 from neopixel import NeoPixel
 import json
+
+# Sicherheitsgrenze fuer Trägheitstest
+MAX_TEST_TEMP_C = 200.0
+SAMPLE_INTERVAL_MS = 1000
 
 # Hardware Setup
 ssrpin = Pin(18, Pin.OUT)
@@ -74,6 +78,7 @@ ble = ESP32_BLE("ESP32")
 
 # Messdaten speichern
 measurements = []
+all_test_runs = []
 start_time = 0
 target_temp = 0
 max_temp = 0
@@ -81,6 +86,7 @@ max_temp_time = 0
 target_reached_time = 0
 start_temp = 0
 heater_power = 0  # PWM Wert in %
+test_power_percent = 0  # Eingestellte Testleistung pro Messlauf
 
 def set_heater(power_percent):
     """Setzt die Heizplatte auf einen PWM-Wert (0-100%)"""
@@ -116,11 +122,16 @@ def measure_with_power(target, power_percent, duration_seconds):
         duration_seconds: Messdauer in Sekunden
     """
     global start_time, target_temp, max_temp, max_temp_time, target_reached_time
-    global start_temp, measurements
+    global start_temp, measurements, test_power_percent, all_test_runs
+
+    # Zieltemperatur hart begrenzen
+    target = min(float(target), MAX_TEST_TEMP_C)
     
     measurements = []
     start_time = time()
+    start_ms = ticks_ms()
     target_temp = target
+    test_power_percent = power_percent
     max_temp = 0
     max_temp_time = 0
     target_reached_time = 0
@@ -134,6 +145,10 @@ def measure_with_power(target, power_percent, duration_seconds):
     print(f"Messdauer: {duration_seconds}s\n")
     ble.send(f"M,start,target,{int(target)},power,{int(power_percent)},t0,{start_temp:.1f}")
     
+    # Waehrend der Traegheitsmessung bleibt der Luefter aus,
+    # damit nur die Aufheizdynamik der Heizplatte gemessen wird.
+    fan.value(0)
+
     # LEDs blau (laufende Messung)
     led_status(0, 0, 255)
     beep(1047, 100)
@@ -142,9 +157,10 @@ def measure_with_power(target, power_percent, duration_seconds):
     set_heater(power_percent)
     
     # Messdaten sammeln
-    while time() - start_time < duration_seconds:
+    while ticks_diff(ticks_ms(), start_ms) < int(duration_seconds * 1000):
         try:
-            current_time = time() - start_time
+            # Jede Iteration liest aktiv einen neuen Sensorwert vom MAX6675.
+            current_time = ticks_diff(ticks_ms(), start_ms) / 1000.0
             temp = max_sensor.readCelsius()
             
             measurements.append({
@@ -163,6 +179,12 @@ def measure_with_power(target, power_percent, duration_seconds):
                 print(f"Zieltemperatur erreicht nach {current_time:.1f}s")
                 beep(2093, 100)
                 ble.send(f"M,target_reached,t,{current_time:.1f},temp,{temp:.1f}")
+
+            # Sicherheitsabschaltung bei max. Testtemperatur
+            if temp >= MAX_TEST_TEMP_C:
+                print(f"Sicherheitsstopp bei {temp:.1f}°C")
+                ble.send(f"M,safety_stop,temp,{temp:.1f},limit,{MAX_TEST_TEMP_C:.1f}")
+                break
             
             # Ausgabe jede Sekunde
             if int(current_time) % 1 == 0 and len(measurements) % 3 == 0:
@@ -179,7 +201,7 @@ def measure_with_power(target, power_percent, duration_seconds):
                     f"M,live,t,{current_time:.1f},temp,{temp:.1f},dT,{(temp-start_temp):.1f},max,{max_temp:.1f}"
                 )
             
-            sleep_ms(100)  # 100ms Messintervall
+            sleep_ms(SAMPLE_INTERVAL_MS)
             
         except Exception as e:
             print(f"Fehler bei Messung: {e}")
@@ -191,7 +213,15 @@ def measure_with_power(target, power_percent, duration_seconds):
     beep(2093, 150)
     
     # Ergebnisse auswerten
-    print_results()
+    result = print_results()
+
+    # Kompletten Lauf speichern (fuer spaeteren JSON-Export)
+    all_test_runs.append({
+        'target_temp': target,
+        'power_percent': test_power_percent,
+        'measurements': measurements,
+        'results': result
+    })
 
 def print_results():
     """Gibt die Messergebnisse aus"""
@@ -211,11 +241,11 @@ def print_results():
     print(f"Overshoot:                {overshoot:+.1f}°C ({overshoot_percent:+.1f}%)")
     print(f"Zeit bis Zieltemperatur:  {target_reached_time:.1f}s")
     print(f"Zeit bis Maximum:         {max_temp_time:.1f}s")
-    print(f"Heizleistung:             {heater_power}%")
+    print(f"Heizleistung:             {test_power_percent}%")
     print(f"Gesamte Messdauer:        {measurements[-1]['time']:.1f}s")
     print("="*70 + "\n")
     ble.send(
-        f"M,result,start,{start_temp:.1f},target,{target_temp:.1f},max,{max_temp:.1f},ov,{overshoot:.1f},tt,{target_reached_time:.1f},tm,{max_temp_time:.1f}"
+        f"M,result,start,{start_temp:.1f},target,{target_temp:.1f},max,{max_temp:.1f},ov,{overshoot:.1f},tt,{target_reached_time:.1f},tm,{max_temp_time:.1f},p,{test_power_percent}"
     )
     
     # Trägheitskonstante (Zeit zum 63% des Zielwertes) - erste Ordnung
@@ -237,7 +267,7 @@ def print_results():
         'overshoot': overshoot,
         'time_to_target': target_reached_time,
         'time_to_max': max_temp_time,
-        'power_percent': heater_power,
+        'power_percent': test_power_percent,
         'tau': tau
     }
 
@@ -245,6 +275,7 @@ def export_data():
     """Exportiert die Messdaten als JSON"""
     try:
         data = {
+            # Letzter Lauf (Rueckwaertskompatibel)
             'measurements': measurements,
             'results': {
                 'start_temp': start_temp,
@@ -253,8 +284,10 @@ def export_data():
                 'overshoot': max_temp - target_temp,
                 'time_to_target': target_reached_time,
                 'time_to_max': max_temp_time,
-                'power_percent': heater_power
-            }
+                'power_percent': test_power_percent
+            },
+            # Alle Laeufe
+            'all_test_runs': all_test_runs
         }
         
         with open('thermal_data.json', 'w') as f:
@@ -273,24 +306,49 @@ if __name__ == "__main__":
     print("="*70)
     print("Dieses Programm misst die Temperaturkurve der Heizplatte")
     print("und bestimmt optimale Regelungsparameter.\n")
+    print(f"Sicherheitslimit: maximal {MAX_TEST_TEMP_C:.0f}°C")
     ble.send("M,ready,1")
     
     try:
-        # Test 1: 50% Power bis 200°C
-        print("\n>>> TEST 1: 50% Heizleistung, Ziel 200°C (max 120s)")
-        measure_with_power(target=200, power_percent=50, duration_seconds=120)
+        # Test 1: 50% Power bis 160°C
+        print("\n>>> TEST 1: 50% Heizleistung, Ziel 160°C (max 120s)")
+        measure_with_power(target=160, power_percent=50, duration_seconds=120)
         
-        sleep_ms(5000)  # Abkühlung
+        # Lüfter einschalten für schnelle Abkühlung
+        fan.value(1)
+        print("\n>>> Abkühlung abwarten (Lüfter AN, Ziel: <50°C) ...")
+        ble.send("M,cooling,1")
+        while True:
+            sleep_ms(10000)
+            t = max_sensor.readCelsius()
+            ble.send(f"M,cooling_temp,{t:.1f}")
+            print(f"  Abkühlung: {t:.1f}°C")
+            if t < 50.0:
+                break
+        fan.value(0)
+        ble.send("M,cooling,0")
         
-        # Test 2: 75% Power bis 250°C
-        print("\n>>> TEST 2: 75% Heizleistung, Ziel 250°C (max 120s)")
-        measure_with_power(target=250, power_percent=75, duration_seconds=120)
+        # Test 2: 75% Power bis 180°C
+        print("\n>>> TEST 2: 75% Heizleistung, Ziel 180°C (max 120s)")
+        measure_with_power(target=180, power_percent=75, duration_seconds=120)
         
-        sleep_ms(5000)  # Abkühlung
+        # Lüfter einschalten für schnelle Abkühlung
+        fan.value(1)
+        print("\n>>> Abkühlung abwarten (Lüfter AN, Ziel: <50°C) ...")
+        ble.send("M,cooling,1")
+        while True:
+            sleep_ms(10000)
+            t = max_sensor.readCelsius()
+            ble.send(f"M,cooling_temp,{t:.1f}")
+            print(f"  Abkühlung: {t:.1f}°C")
+            if t < 50.0:
+                break
+        fan.value(0)
+        ble.send("M,cooling,0")
         
-        # Test 3: 100% Power bis 300°C
-        print("\n>>> TEST 3: 100% Heizleistung, Ziel 300°C (max 120s)")
-        measure_with_power(target=300, power_percent=100, duration_seconds=120)
+        # Test 3: 100% Power bis 200°C
+        print("\n>>> TEST 3: 100% Heizleistung, Ziel 200°C (max 120s)")
+        measure_with_power(target=200, power_percent=100, duration_seconds=120)
         
         # Daten exportieren
         export_data()

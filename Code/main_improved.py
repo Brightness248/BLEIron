@@ -5,7 +5,7 @@ Berücksichtigt thermische Trägheit für bessere Regelung
 
 from machine import Pin, Timer
 import machine
-from time import sleep_ms, time
+from time import sleep_ms, time, ticks_ms
 import ubluetooth
 from neopixel import NeoPixel
 from max6675 import MAX6675
@@ -15,8 +15,20 @@ import binascii
 # Diese Werte nach measure_inertia.py eintragen.
 # Beispiel: M,tau,15.2  -> THERMAL_TAU_S = 15.2
 # Totzeit grob: Zeit bis messbarer Temperaturanstieg nach Heizer-Start.
-THERMAL_TAU_S = 8.0
-THERMAL_DEAD_TIME_S = 2.0
+THERMAL_TAU_S = 38.0
+THERMAL_DEAD_TIME_S = 5.0
+
+# Reflow-Profil und Cooldown
+COOLDOWN_END_TEMP_C = 80.0 # Ende der aktiven Lüfterkühlung
+
+# Sensor-Filter gegen kurze Messspruenge durch Stoerungen
+TEMP_FILTER_ALPHA = 0.35
+MAX_TEMP_STEP_C_PER_S = 6.0
+
+# Reflow-Rampen fuer "Peak bei t = Dauer"
+PREHEAT_END_RATIO = 0.55
+SOAK_END_RATIO = 0.85
+PEAK_REACH_RATIO = 1.00
 
 # ============ HARDWARE SETUP ============
 # Heizplatte (SSR mit PWM)
@@ -25,10 +37,13 @@ ssr = machine.PWM(ssrpin, freq=1)
 ssrpin.value(0)
 ssr.duty(0)
 
-# Lüfter (PWM gesteuert, 60-100%)
-fanpin = Pin(2, Pin.OUT)
-fan = machine.PWM(fanpin, freq=1000)  # 1 kHz PWM für Lüfter
-fan.duty(0)
+# Lüfter (Digital ON/OFF, robuster mit verbautem Lüfter)
+fan = Pin(2, Pin.OUT)
+fan.value(0)
+
+# Beleuchtung (separater Ausgang)
+bel = Pin(17, Pin.OUT)
+bel.value(0)
 
 # Status LEDs
 pixels = NeoPixel(Pin(15), 16)
@@ -39,6 +54,67 @@ max_sensor = MAX6675()
 
 # ============ BLE SETUP ============
 message = ""
+SERIAL_DEBUG = False
+
+
+def log(text):
+    """Serielle Debug-Ausgabe zentral ein/aus schalten."""
+    if SERIAL_DEBUG:
+        print(text)
+
+
+def send_temp_ble(temp_c):
+    """Kompatibel zur bestehenden App: nur Temperatur als Zahl senden."""
+    try:
+        ble.send(str(round(temp_c, 1)))
+    except:
+        pass
+
+
+def clamp(value, low, high):
+    if value < low:
+        return low
+    if value > high:
+        return high
+    return value
+
+
+def profile_setpoint(start_temp, peak_temp, total_s, elapsed_s):
+    """Solltemperatur entlang einer Reflow-Kurve aus der Gesamtdauer berechnen."""
+    preheat_t = total_s * PREHEAT_END_RATIO
+    soak_t = total_s * SOAK_END_RATIO
+    peak_t = total_s * PEAK_REACH_RATIO
+    preheat_target = min(150.0, peak_temp - 30.0)
+    soak_target = min(peak_temp - 10.0, 170.0)
+    if soak_target < preheat_target:
+        soak_target = preheat_target + 5.0
+
+    if elapsed_s <= preheat_t:
+        frac = elapsed_s / preheat_t if preheat_t > 0 else 1.0
+        return start_temp + frac * (preheat_target - start_temp)
+
+    if elapsed_s <= soak_t:
+        frac = (elapsed_s - preheat_t) / max(0.1, (soak_t - preheat_t))
+        return preheat_target + frac * (soak_target - preheat_target)
+
+    if elapsed_s <= peak_t:
+        frac = (elapsed_s - soak_t) / max(0.1, (peak_t - soak_t))
+        return soak_target + frac * (peak_temp - soak_target)
+
+    return peak_temp
+
+
+def pulse_green_leds():
+    """Lässt alle LEDs grün pulsieren (Cooldown-Phase)."""
+    phase = (ticks_ms() // 40) % 100
+    if phase < 50:
+        level = int(255 * phase / 50)
+    else:
+        level = int(255 * (100 - phase) / 50)
+
+    for x in range(16):
+        pixels[x] = (0, level, 0)
+    pixels.write()
 
 class ESP32_BLE():
     def __init__(self, name):
@@ -109,7 +185,7 @@ class ESP32_BLE():
         elif event == 3:
             buffer = self.ble.gatts_read(self.rx).replace(b'\x00', b'')
             message = buffer.decode('UTF-8').strip()
-            print(f"BLE empfangen: {message}")
+            log(f"BLE empfangen: {message}")
 
     def register(self):
         NUS_UUID = '6E400001-B5A3-F393-E0A9-E50E24DCCA9E'
@@ -293,12 +369,9 @@ class TemperatureController:
         fan_setpoint = setpoint - max(0.0, temp_rate * self.tau * 0.15)
         fan_output = self.fan.update(fan_setpoint, current_temp)
         
-        # Status-Text
+        # Status-Text (ASCII-only for robust parsing on device)
         error = setpoint - current_temp
-        status = (
-            f"T_ist={current_temp:.1f}°C, T_pred={control_temp:.1f}°C, "
-            f"T_soll={setpoint}°C, Fehler={error:+.1f}°C"
-        )
+        status = f"T_ist={current_temp:.1f}degC, T_pred={control_temp:.1f}degC, T_soll={setpoint}degC, Fehler={error:+.1f}degC"
         
         # Heizer-PWM anpassen (minimal 15% für Grundlast, maximal 100%)
         if abs(error) < 0.5:
@@ -314,7 +387,7 @@ class TemperatureController:
         """Setzt thermische Parameter (aus Messung)"""
         self.tau = tau
         self.dead_time = dead_time
-        print(f"Thermische Parameter: τ={tau}s, Totzeit={dead_time}s")
+        log(f"Thermische Parameter: τ={tau}s, Totzeit={dead_time}s")
 
 # ============ HAUPTPROGRAMM ============
 
@@ -324,70 +397,133 @@ controller = TemperatureController()
 
 status = 0  # 0=Idle, 1=Heizen
 message = ""
+manual_fan_override = False
+manual_fan_on = False
+process_duration_s = 0
+profile_peak_temp = 200
+profile_start_temp = 25.0
+process_start_time = 0
+peak_hold_s = 12.0
+peak_hold_start = None
+cooldown_active = False
 last_print_time = time()
+last_debug_time = time()
+last_sensor_read_time = 0
+current_temp = 25.0  # Startwert
+raw_temp = 25.0
 
-print("\n" + "="*70)
-print("VERBESSERTE TEMPERATURREGELUNG")
-print("="*70)
-print("System läuft...")
+log("\n" + "="*70)
+log("VERBESSERTE TEMPERATURREGELUNG")
+log("="*70)
+log("System läuft...")
 
 sleep_ms(500)
 
 # Hauptschleife
 while True:
     try:
-        # Temperatur auslesen
-        current_temp = max_sensor.readCelsius()
         current_time = time()
+
+        # MAX6675 max. 1x pro Sekunde lesen (sonst Rauschspikes vom SSR)
+        if current_time - last_sensor_read_time >= 1.0:
+            new_raw_temp = max_sensor.readCelsius()
+
+            # Erster Messwert: direkt uebernehmen
+            if last_sensor_read_time == 0:
+                current_temp = new_raw_temp
+            else:
+                sample_dt = max(0.5, current_time - last_sensor_read_time)
+                max_step = MAX_TEMP_STEP_C_PER_S * sample_dt
+
+                # Unplausible Einzelspitzen begrenzen
+                delta = new_raw_temp - current_temp
+                if delta > max_step:
+                    new_raw_temp = current_temp + max_step
+                elif delta < -max_step:
+                    new_raw_temp = current_temp - max_step
+
+                # Glaettung fuer stabile Kurve in der App
+                current_temp = current_temp + TEMP_FILTER_ALPHA * (new_raw_temp - current_temp)
+
+            raw_temp = new_raw_temp
+            last_sensor_read_time = current_time
         
         # Status 0: Standby
         if status == 0:
             controller.pid.reset()
             ssr.duty(0)
-            fan.duty(0)
+            if manual_fan_override:
+                fan.value(1 if manual_fan_on else 0)
+            else:
+                fan.value(0)
             
             # Temperaturdaten senden (jede Sekunde)
             if current_time - last_print_time > 1.0:
-                try:
-                    ble.send(f"Idle: {current_temp:.1f}°C")
-                except:
-                    pass
+                send_temp_ble(current_temp)
                 last_print_time = current_time
         
         # Status 1: Heizen
         elif status == 1:
-            heater_pwm, fan_pwm, status_text = controller.update(target_temp, current_temp)
+            elapsed = current_time - process_start_time
+            ramp_elapsed = min(elapsed, process_duration_s)
+            dynamic_setpoint = profile_setpoint(
+                profile_start_temp,
+                profile_peak_temp,
+                process_duration_s,
+                ramp_elapsed
+            )
+
+            # Peak-Hold startet erst nach Ablauf der Soll-Zeit (time-to-peak)
+            if elapsed >= process_duration_s:
+                if peak_hold_start is None:
+                    peak_hold_start = current_time
+                dynamic_setpoint = profile_peak_temp
+
+            hold_done = (
+                peak_hold_start is not None and
+                (current_time - peak_hold_start) >= peak_hold_s
+            )
+
+            if hold_done:
+                cooldown_active = True
+                status = 0
+                ssr.duty(0)
+                fan.value(1)
+                manual_fan_override = True
+                manual_fan_on = True
+                pulse_green_leds()
+                message = ""
+                continue
+
+            heater_pwm, fan_pwm, status_text = controller.update(dynamic_setpoint, current_temp)
             
             # Heizleistung setzen
             ssr.duty(int(1023 / 100 * heater_pwm))
             
             # Lüfter setzen
-            if fan_pwm > 0:
-                fan.duty(int(1023 / 100 * fan_pwm))
+            if manual_fan_override:
+                fan.value(1 if manual_fan_on else 0)
             else:
-                fan.duty(0)
+                fan.value(1 if fan_pwm > 0 else 0)
             
             # Daten senden
             if current_time - last_print_time > controller.send_interval:
-                data_str = f"H:{int(heater_pwm)},F:{int(fan_pwm)},T:{current_temp:.1f}"
-                try:
-                    ble.send(data_str)
-                except:
-                    pass
+                send_temp_ble(current_temp)
+                last_print_time = current_time
                 
-                # Debug-Ausgabe
-                if current_time - last_print_time > 2.0:
-                    print(f"{status_text} | Heizer={int(heater_pwm)}% Lüfter={int(fan_pwm)}%")
-                    last_print_time = current_time
+                # Debug output (ASCII-only)
+                if current_time - last_debug_time > 2.0:
+                    log(f"{status_text} | Soll_dyn={dynamic_setpoint:.1f}degC | Heizer={int(heater_pwm)}% Luefter={int(fan_pwm)}%")
+                    last_debug_time = current_time
             
             # Zieltemperatur erreicht?
-            if abs(current_temp - target_temp) < 1.0:
+            if abs(current_temp - dynamic_setpoint) < 1.0:
                 led_r = 0
                 led_g = 255
                 led_b = 0
             else:
                 # LED rot wenn zu kalt, gelb wenn zu heiß
-                if current_temp < target_temp:
+                if current_temp < dynamic_setpoint:
                     led_r = 255
                     led_g = 0
                     led_b = 0
@@ -399,15 +535,36 @@ while True:
             for x in range(16):
                 pixels[x] = (led_r, led_g, led_b)
             pixels.write()
+
+        # Cooldown-Phase nach Reflow-Ende
+        if cooldown_active:
+            ssr.duty(0)
+            fan.value(1)
+            pulse_green_leds()
+
+            if current_time - last_print_time > 1.0:
+                send_temp_ble(current_temp)
+                last_print_time = current_time
+
+            # Bei ausreichend Abkühlung in normalen Idle zurück
+            if current_temp <= COOLDOWN_END_TEMP_C:
+                cooldown_active = False
+                manual_fan_override = False
+                manual_fan_on = False
+                fan.value(0)
         
         # BLE-Befehle verarbeiten
         if message == "A1":
             # Abbruch
             status = 0
             message = ""
-            fan.duty(0)
+            cooldown_active = False
+            manual_fan_override = True
+            manual_fan_on = True
+            fan.value(1)
             ssr.duty(0)
-            print("Regelung abgebrochen")
+            peak_hold_start = None
+            log("Regelung abgebrochen")
             
             buzzer = machine.PWM(buz)
             buzzer.freq(2000)
@@ -421,10 +578,22 @@ while True:
             # z.B. "time,600,temp,250"
             try:
                 parts = message.split(',')
-                target_temp = int(parts[3]) if len(parts) > 3 else 200
+                process_duration_s = int(parts[1]) if len(parts) > 1 else 240
+                profile_peak_temp = int(parts[3]) if len(parts) > 3 else 230
+                process_duration_s = max(60, process_duration_s)
+                profile_peak_temp = int(clamp(profile_peak_temp, 180, 260))
+
+                peak_hold_s = clamp(process_duration_s * 0.06, 8.0, 20.0)
+                profile_start_temp = current_temp
+                process_start_time = current_time
+                peak_hold_start = None
+
                 status = 1
+                cooldown_active = False
+                manual_fan_override = False
+                manual_fan_on = False
                 controller.pid.reset()
-                print(f"Regelung gestartet: Ziel {target_temp}°C")
+                log("Reflow gestartet: Dauer=%ss, Peak=%sdegC, Hold=%.1fs" % (process_duration_s, profile_peak_temp, peak_hold_s))
                 message = ""
                 
                 buzzer = machine.PWM(buz)
@@ -437,14 +606,58 @@ while True:
                 message = ""
         
         elif message == "B1":
-            # Beleuchtung (nicht implementiert in dieser Version)
+            # Beleuchtung toggeln (kompatibel zu main.py)
+            bel.value(0 if bel.value() else 1)
             message = ""
-            print("Beleuchtung nicht implementiert")
+            log("Beleuchtung toggeln")
+
+            buzzer = machine.PWM(buz)
+            buzzer.freq(2000)
+            buzzer.duty(50)
+            sleep_ms(100)
+            buzzer.duty(0)
+            buzzer.deinit()
+
+        elif message == "K1":
+            # Lüfter toggeln (manuelle Übersteuerung)
+            cooldown_active = False
+            manual_fan_override = True
+            manual_fan_on = not manual_fan_on
+            fan.value(1 if manual_fan_on else 0)
+            message = ""
+            log("Luefter toggeln")
+
+            buzzer = machine.PWM(buz)
+            buzzer.freq(2000)
+            buzzer.duty(50)
+            sleep_ms(100)
+            buzzer.duty(0)
+            buzzer.deinit()
+
+        elif message == "K0":
+            # Lüfter explizit AUS (manuell)
+            cooldown_active = False
+            manual_fan_override = True
+            manual_fan_on = False
+            fan.value(0)
+            message = ""
+            log("Luefter aus (manuell)")
+
+        elif message == "KA":
+            # Lüfter zurück auf Automatik
+            cooldown_active = False
+            manual_fan_override = False
+            message = ""
+            log("Luefter auf Automatik")
+
+        elif message == "BR":
+            # Kompatibel zu main.py: Schleife verlassen
+            break
         
         sleep_ms(50)  # 50ms Regelungsintervall
         
     except Exception as e:
-        print(f"Fehler: {e}")
+        log(f"Fehler: {e}")
         ssr.duty(0)
-        fan.duty(0)
+        fan.value(0)
         sleep_ms(1000)

@@ -13,6 +13,7 @@ Diese Anleitung beschreibt kurz:
 ## 1) Traegheit messen
 1. `measure_inertia.py` auf den ESP32 laden und starten.
 2. Das Skript faehrt automatisch 3 Tests (50%, 75%, 100% Heizleistung).
+3. Sicherheitsregel: Es wird maximal bis 200 Grad C getestet (harte Abschaltung bei 200 Grad C).
 3. Alle wichtigen Daten werden per BLE gesendet.
 
 ## 2) Relevante BLE-Nachrichten
@@ -71,3 +72,24 @@ Damit wird Ueberschwingen reduziert und die Zieltemperatur besser getroffen.
 Der Luefter bleibt im sicheren Bereich fuer deinen 12V-Luefter:
 - PWM nur 60-100% (oder aus)
 - Kein Dauerbetrieb unter 50%
+
+## Schnelldiagnose bei dT = 0
+Wenn die Traegheitsmessung keine Temperaturaenderung zeigt, nutze `diag_heater_path.py`.
+
+### Ablauf
+1. `diag_heater_path.py` auf den ESP32 laden und starten.
+2. BLE-Log beobachten.
+3. Wichtige Meldungen:
+   - `D,result,base,...` -> Sensor-Basischeck
+   - `D,result,p30,delta,...`
+   - `D,result,p60,delta,...`
+   - `D,result,p100,delta,...`
+   - `D,conclusion,...`
+
+### Interpretation
+- `D,conclusion,path_ok`
+  - Heizpfad und Sensor reagieren grundsaetzlich.
+- `D,conclusion,heater_path_fault`
+  - Sensor lebt, aber Heizwirkung fehlt. SSR/Netzpfad/Heizelement pruefen.
+- `D,conclusion,sensor_or_wiring_fault`
+  - Sensorleitung oder Sensor selbst pruefen (MAX6675, Thermoelement-Polaritaet, Kontakt).
