@@ -77,8 +77,17 @@ In addition to the smartphone app, a **CYD (Cheap Yellow Display) ESP32** board 
 
 The CYD connects to BLEIron via BLE (Nordic UART Service, same UUIDs as the app) and provides:
 
+<p align="center">
+  <img height="320" src="/CYD Display/Images/GUI.jpg" alt="CYD touch GUI">
+</p>
+
 - **Touch-based controls** — set target temperature and duration directly on the display
 - **Live temperature chart** — a scrolling line chart shows the actual temperature vs. the reflow profile setpoint over time
+
+<p align="center">
+  <img height="320" src="/CYD Display/Images/Chart_fullscreen.jpg" alt="CYD fullscreen temperature chart">
+</p>
+
 - **Status display** — current phase (Preheat / Soak / Reflow / Cooldown), elapsed time, and heater duty cycle
 - **Fan & light control** — dedicated buttons send `K1`, `K0`, `KA` and `B1` BLE commands
 
