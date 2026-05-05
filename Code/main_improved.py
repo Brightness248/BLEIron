@@ -327,7 +327,8 @@ class TemperatureController:
     """Hauptregelungslogik"""
     
     def __init__(self):
-        self.pid = PIDController(kp=1.0, ki=0.08, kd=0.4)
+        # Konservativer abgestimmt, um Ueberschwingen zu reduzieren
+        self.pid = PIDController(kp=0.75, ki=0.03, kd=0.45)
         self.fan = FanController()
         self.last_send_time = 0
         self.send_interval = 0.5  # Daten jede 0.5s senden
@@ -373,13 +374,18 @@ class TemperatureController:
         error = setpoint - current_temp
         status = f"T_ist={current_temp:.1f}degC, T_pred={control_temp:.1f}degC, T_soll={setpoint}degC, Fehler={error:+.1f}degC"
         
-        # Heizer-PWM anpassen (minimal 15% für Grundlast, maximal 100%)
-        if abs(error) < 0.5:
-            heater_pwm = 0  # Bei Zielwert abschalten
-        elif error > 0:
-            heater_pwm = max(15, min(heater_output, 100))
+        # Heizer-PWM anpassen: keine feste Mindestleistung (15%) mehr,
+        # damit niedrige Sollwerte nicht ueberschossen werden.
+        if error <= 0:
+            heater_pwm = 0
+        elif error < 1.5:
+            heater_pwm = min(max(heater_output, 0), 35)
         else:
-            heater_pwm = max(0, heater_output)
+            heater_pwm = min(max(heater_output, 0), 100)
+
+        # Vorausschauender Cutoff kurz vor Sollwert, wenn Temperatur noch steigt.
+        if current_temp >= (setpoint - 0.4) and temp_rate > 0:
+            heater_pwm = 0
         
         return heater_pwm, fan_output, status
 
@@ -581,7 +587,8 @@ while True:
                 process_duration_s = int(parts[1]) if len(parts) > 1 else 240
                 profile_peak_temp = int(parts[3]) if len(parts) > 3 else 230
                 process_duration_s = max(60, process_duration_s)
-                profile_peak_temp = int(clamp(profile_peak_temp, 180, 260))
+                # Zieltemperatur aus App respektieren (z. B. 120C Testfahrten)
+                profile_peak_temp = int(clamp(profile_peak_temp, 50, 260))
 
                 peak_hold_s = clamp(process_duration_s * 0.06, 8.0, 20.0)
                 profile_start_temp = current_temp
